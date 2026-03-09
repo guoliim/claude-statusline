@@ -92,6 +92,24 @@ function uninstall() {
     }
   }
 
+  // Clean up runtime cache files
+  const tmpDir = path.join(os.tmpdir(), "claude");
+  const cacheFiles = [
+    path.join(tmpDir, "statusline-usage-cache.json"),
+    path.join(tmpDir, "statusline-usage-cache.json.tmp"),
+    path.join(tmpDir, "statusline-usage-error"),
+  ];
+  let cleaned = 0;
+  for (const f of cacheFiles) {
+    if (fs.existsSync(f)) {
+      fs.unlinkSync(f);
+      cleaned++;
+    }
+  }
+  if (cleaned > 0) {
+    success(`Cleaned up ${cleaned} cache file${cleaned > 1 ? "s" : ""}`);
+  }
+
   console.log();
   log(`${green}Done!${reset} Restart Claude Code to apply changes.`);
   console.log();
