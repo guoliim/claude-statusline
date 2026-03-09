@@ -356,6 +356,14 @@ fi
 
 # ── Output ──────────────────────────────────────────────
 printf "%b" "$line1"
-[ -n "$rate_lines" ] && printf "\n\n%b" "$rate_lines"
+if [ -n "$rate_lines" ]; then
+    printf "\n\n%b" "$rate_lines"
+elif [ -n "$api_error" ]; then
+    case "$api_error" in
+        no_token)  printf "\n\n${dim}⚠ no token — rate limits unavailable${reset}" ;;
+        cached)    printf "\n\n${dim}⚠ rate limits temporarily unavailable${reset}" ;;
+        *)         printf "\n\n${dim}⚠ api error (${api_error})${reset}" ;;
+    esac
+fi
 
 exit 0
