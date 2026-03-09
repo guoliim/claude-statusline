@@ -9,14 +9,15 @@ if [ -z "$input" ]; then
 fi
 
 # ── Colors ──────────────────────────────────────────────
-blue='\033[38;2;0;153;255m'
-orange='\033[38;2;255;176;85m'
-green='\033[38;2;0;175;80m'
-cyan='\033[38;2;86;182;194m'
-red='\033[38;2;255;85;85m'
-yellow='\033[38;2;230;200;0m'
-white='\033[38;2;220;220;220m'
-magenta='\033[38;2;180;140;255m'
+# Muted base — only dynamic % values get saturated color
+soft='\033[38;2;200;200;210m'       # model name, constants
+muted='\033[38;2;130;160;190m'      # directory, secondary info
+branch='\033[38;2;80;180;140m'      # git branch
+orange='\033[38;2;235;160;70m'      # pct 50-69%
+red='\033[38;2;240;80;80m'          # pct 90%+, dirty marker
+yellow='\033[38;2;220;190;50m'      # pct 70-89%
+green='\033[38;2;80;190;120m'       # pct <50%
+accent='\033[38;2;170;130;240m'     # thinking mode active
 dim='\033[2m'
 reset='\033[0m'
 
@@ -41,24 +42,6 @@ color_for_pct() {
     elif [ "$pct" -ge 50 ]; then printf "$orange"
     else printf "$green"
     fi
-}
-
-build_bar() {
-    local pct=$1
-    local width=$2
-    [ "$pct" -lt 0 ] 2>/dev/null && pct=0
-    [ "$pct" -gt 100 ] 2>/dev/null && pct=100
-
-    local filled=$(( pct * width / 100 ))
-    local empty=$(( width - filled ))
-    local bar_color
-    bar_color=$(color_for_pct "$pct")
-
-    local filled_str="" empty_str=""
-    for ((i=0; i<filled; i++)); do filled_str+="●"; done
-    for ((i=0; i<empty; i++)); do empty_str+="○"; done
-
-    printf "${bar_color}${filled_str}${dim}${empty_str}${reset}"
 }
 
 iso_to_epoch() {
@@ -175,21 +158,21 @@ if [ -n "$session_start" ] && [ "$session_start" != "null" ]; then
     fi
 fi
 
-line1="${blue}${model_name}${reset}"
+line1="${soft}${model_name}${reset}"
 line1+="${sep}"
-line1+="✍️ ${pct_color}${pct_used}%${reset}"
+line1+="${pct_color}${pct_used}%${reset}"
 line1+="${sep}"
-line1+="${cyan}${dirname}${reset}"
+line1+="${muted}${dirname}${reset}"
 if [ -n "$git_branch" ]; then
-    line1+=" ${green}(${git_branch}${red}${git_dirty}${green})${reset}"
+    line1+=" ${branch}(${git_branch}${red}${git_dirty}${branch})${reset}"
 fi
 if [ -n "$session_duration" ]; then
     line1+="${sep}"
-    line1+="${dim}⏱ ${reset}${white}${session_duration}${reset}"
+    line1+="${dim}${session_duration}${reset}"
 fi
 line1+="${sep}"
 if $thinking_on; then
-    line1+="${magenta}◐ thinking${reset}"
+    line1+="${accent}◐ thinking${reset}"
 else
     line1+="${dim}◑ thinking${reset}"
 fi
@@ -388,7 +371,6 @@ fi
 rate_lines=""
 
 if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
-    bar_width=10
 
     IFS=$'\t' read -r five_hour_pct five_hour_reset_iso seven_day_pct seven_day_reset_iso \
         extra_enabled extra_pct extra_used extra_limit <<< \
@@ -404,34 +386,25 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
       ] | join("\t")')"
 
     five_hour_reset=$(format_reset_time "$five_hour_reset_iso" "time")
-    five_hour_bar=$(build_bar "$five_hour_pct" "$bar_width")
     five_hour_pct_color=$(color_for_pct "$five_hour_pct")
-    five_hour_pct_fmt=$(printf "%3d" "$five_hour_pct")
-
-    rate_lines+="${white}current${reset} ${five_hour_bar} ${five_hour_pct_color}${five_hour_pct_fmt}%${reset} ${dim}⟳${reset} ${white}${five_hour_reset}${reset}"
 
     seven_day_reset=$(format_reset_time "$seven_day_reset_iso" "datetime")
-    seven_day_bar=$(build_bar "$seven_day_pct" "$bar_width")
     seven_day_pct_color=$(color_for_pct "$seven_day_pct")
-    seven_day_pct_fmt=$(printf "%3d" "$seven_day_pct")
 
-    rate_lines+="\n${white}weekly${reset}  ${seven_day_bar} ${seven_day_pct_color}${seven_day_pct_fmt}%${reset} ${dim}⟳${reset} ${white}${seven_day_reset}${reset}"
+    rate_lines+="${dim}cur${reset} ${five_hour_pct_color}${five_hour_pct}%${reset} ${dim}⟳ ${five_hour_reset}${reset}"
+    rate_lines+="${sep}"
+    rate_lines+="${dim}wk${reset} ${seven_day_pct_color}${seven_day_pct}%${reset} ${dim}⟳ ${seven_day_reset}${reset}"
 
     if [ "$extra_enabled" = "true" ]; then
-        extra_used=$(printf "%.2f" "$extra_used")
-        extra_limit=$(printf "%.2f" "$extra_limit")
-        extra_bar=$(build_bar "$extra_pct" "$bar_width")
+        extra_used=$(printf "%.0f" "$extra_used")
+        extra_limit=$(printf "%.0f" "$extra_limit")
         extra_pct_color=$(color_for_pct "$extra_pct")
 
         extra_reset=$(date -v+1m -v1d +"%b %-d" 2>/dev/null | tr '[:upper:]' '[:lower:]')
-        if [ -z "$extra_reset" ]; then
-            extra_reset=$(date -d "$(date +%Y-%m-01) +1 month" +"%b %-d" 2>/dev/null | tr '[:upper:]' '[:lower:]')
-        fi
+        [ -z "$extra_reset" ] && extra_reset=$(date -d "$(date +%Y-%m-01) +1 month" +"%b %-d" 2>/dev/null | tr '[:upper:]' '[:lower:]')
 
-        extra_col="${white}extra${reset}   ${extra_bar} ${extra_pct_color}\$${extra_used}${dim}/${reset}${white}\$${extra_limit}${reset}"
-        extra_reset_line="${dim}resets ${reset}${white}${extra_reset}${reset}"
-        rate_lines+="\n${extra_col}"
-        rate_lines+="\n${extra_reset_line}"
+        rate_lines+="${sep}"
+        rate_lines+="${extra_pct_color}\$${extra_used}${dim}/\$${extra_limit} ⟳ ${extra_reset}${reset}"
     fi
 fi
 
