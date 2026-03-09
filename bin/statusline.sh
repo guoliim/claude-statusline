@@ -243,7 +243,8 @@ get_oauth_token() {
 cache_file="/tmp/claude/statusline-usage-cache.json"
 cache_max_age=60
 err_cache="/tmp/claude/statusline-usage-error"
-err_max_age=300
+headers_tmp="/tmp/claude/statusline-headers.tmp"
+response_tmp="/tmp/claude/statusline-response.tmp"
 mkdir -p /tmp/claude
 
 needs_refresh=true
@@ -260,39 +261,118 @@ if [ -f "$cache_file" ]; then
     fi
 fi
 
-# Skip refresh if in negative cache period (recent API failure)
+# Skip refresh if server told us to wait (Retry-After / backoff)
+# Format in err_cache: retry_until_epoch<TAB>http_code<TAB>message
+# But always retry if this is a new session (started after the error was cached)
 if $needs_refresh && [ -f "$err_cache" ]; then
-    err_mtime=$(stat -c %Y "$err_cache" 2>/dev/null || stat -f %m "$err_cache" 2>/dev/null)
-    if [ -n "$err_mtime" ]; then
-        err_age=$(( now - err_mtime ))
-        if [ "$err_age" -lt "$err_max_age" ]; then
+    IFS=$'\t' read -r retry_until_epoch cached_http_code cached_err_msg < "$err_cache"
+    if [ -n "$retry_until_epoch" ] && [ "$now" -lt "$retry_until_epoch" ] 2>/dev/null; then
+        session_epoch=$(iso_to_epoch "$session_start" 2>/dev/null)
+        err_mtime=$(stat -c %Y "$err_cache" 2>/dev/null || stat -f %m "$err_cache" 2>/dev/null)
+        if [ -n "$session_epoch" ] && [ -n "$err_mtime" ] && [ "$session_epoch" -gt "$err_mtime" ]; then
+            : # New session — allow retry
+        else
             needs_refresh=false
-            api_error="cached"
+            api_error="cached:${cached_http_code}:${cached_err_msg}"
+            # Load stale cache so rate bars still display
+            if [ -f "$cache_file" ]; then
+                usage_data=$(cat "$cache_file" 2>/dev/null)
+            fi
+        fi
+    else
+        rm -f "$err_cache"
+    fi
+fi
+
+if $needs_refresh; then
+    # Lock: prevent concurrent requests (thundering herd)
+    # mkdir is atomic — only one process succeeds
+    lock_file="/tmp/claude/statusline-fetch.lock"
+    if ! mkdir "$lock_file" 2>/dev/null; then
+        # Stale lock? (curl --max-time is 5s, so 10s is generous)
+        lock_mtime=$(stat -c %Y "$lock_file" 2>/dev/null || stat -f %m "$lock_file" 2>/dev/null)
+        if [ -n "$lock_mtime" ] && [ $(( now - lock_mtime )) -gt 10 ]; then
+            rmdir "$lock_file" 2>/dev/null
+            mkdir "$lock_file" 2>/dev/null || needs_refresh=false
+        else
+            needs_refresh=false
+        fi
+        if ! $needs_refresh && [ -f "$cache_file" ]; then
+            usage_data=$(cat "$cache_file" 2>/dev/null)
         fi
     fi
 fi
 
 if $needs_refresh; then
+    trap 'rmdir "$lock_file" 2>/dev/null' EXIT
     token=$(get_oauth_token)
     if [ -n "$token" ] && [ "$token" != "null" ]; then
         claude_ver=$(timeout 0.5 claude --version 2>/dev/null | head -1 || echo "unknown")
-        response=$(curl -s --max-time 5 \
+        http_code=$(curl -s -o "$response_tmp" -D "$headers_tmp" -w '%{http_code}' --max-time 5 \
             -H "Accept: application/json" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $token" \
             -H "anthropic-beta: oauth-2025-04-20" \
             -H "User-Agent: claude-statusline/1.0 (claude-code/${claude_ver})" \
             "https://api.anthropic.com/api/oauth/usage" 2>/dev/null)
-        if [ -n "$response" ] && echo "$response" | jq -e '.five_hour' >/dev/null 2>&1; then
+        response=$(cat "$response_tmp" 2>/dev/null)
+        rm -f "$response_tmp"
+        if [ "$http_code" = "200" ] && [ -n "$response" ] && echo "$response" | jq -e '.five_hour' >/dev/null 2>&1; then
             usage_data="$response"
             echo "$response" > "${cache_file}.tmp" && mv "${cache_file}.tmp" "$cache_file"
-            rm -f "$err_cache"
-        elif [ -n "$response" ] && echo "$response" | jq -e '.error' >/dev/null 2>&1; then
-            api_error=$(echo "$response" | jq -r '.error.type // "unknown"')
-            touch "$err_cache"
+            rm -f "$err_cache" "$headers_tmp"
         else
-            api_error="request_failed"
-            touch "$err_cache"
+            # Parse Retry-After header (RFC 9110 §10.2.3): seconds or HTTP-date
+            retry_after=""
+            if [ -f "$headers_tmp" ]; then
+                retry_after=$(grep -i '^retry-after:' "$headers_tmp" | head -1 | sed 's/^[^:]*: *//; s/\r$//')
+            fi
+            rm -f "$headers_tmp"
+
+            # Calculate retry-until epoch from Retry-After
+            retry_until=""
+            if [ -n "$retry_after" ]; then
+                if echo "$retry_after" | grep -qE '^[0-9]+$'; then
+                    # Retry-After: <delay-seconds>
+                    retry_until=$(( now + retry_after ))
+                else
+                    # Retry-After: <http-date>  (e.g. "Mon, 09 Mar 2026 12:00:00 GMT")
+                    retry_until=$(date -d "$retry_after" +%s 2>/dev/null)
+                    [ -z "$retry_until" ] && retry_until=$(date -j -f "%a, %d %b %Y %H:%M:%S %Z" "$retry_after" +%s 2>/dev/null)
+                fi
+            fi
+
+            # Per-status-code handling with default backoff
+            err_msg=$(echo "$response" | jq -r '.error.message // empty' 2>/dev/null)
+            case "$http_code" in
+                429)
+                    api_error="rate_limited"
+                    [ -z "$retry_until" ] && retry_until=$(( now + 60 ))
+                    ;;
+                401)
+                    api_error="auth_expired"
+                    retry_until=$(( now + 86400 * 365 ))
+                    ;;
+                403)
+                    api_error="forbidden"
+                    retry_until=$(( now + 86400 * 365 ))
+                    ;;
+                5[0-9][0-9])
+                    api_error="server_error:${http_code}"
+                    [ -z "$retry_until" ] && retry_until=$(( now + 120 ))
+                    ;;
+                000)
+                    api_error="network_error"
+                    [ -z "$retry_until" ] && retry_until=$(( now + 30 ))
+                    ;;
+                *)
+                    api_error="http_error:${http_code}"
+                    [ -z "$retry_until" ] && retry_until=$(( now + 300 ))
+                    ;;
+            esac
+
+            # Store: retry_until_epoch<TAB>http_code<TAB>display_message
+            printf '%s\t%s\t%s\n' "$retry_until" "$http_code" "${err_msg}" > "$err_cache"
         fi
     else
         api_error="no_token"
@@ -301,6 +381,7 @@ if $needs_refresh; then
     if [ -z "$usage_data" ] && [ -f "$cache_file" ]; then
         usage_data=$(cat "$cache_file" 2>/dev/null)
     fi
+    rmdir "$lock_file" 2>/dev/null
 fi
 
 # ── Rate limit lines ────────────────────────────────────
@@ -359,10 +440,53 @@ printf "%b" "$line1"
 if [ -n "$rate_lines" ]; then
     printf "\n\n%b" "$rate_lines"
 elif [ -n "$api_error" ]; then
+    # Format remaining wait time for display
+    _retry_wait_msg() {
+        local until_epoch="$1"
+        [ -z "$until_epoch" ] && return
+        local remaining=$(( until_epoch - $(date +%s) ))
+        [ "$remaining" -le 0 ] && return
+        if [ "$remaining" -ge 60 ]; then
+            printf " (retry in %dm)" $(( remaining / 60 ))
+        else
+            printf " (retry in %ds)" "$remaining"
+        fi
+    }
+
     case "$api_error" in
-        no_token)  printf "\n\n${dim}⚠ no token — rate limits unavailable${reset}" ;;
-        cached)    printf "\n\n${dim}⚠ rate limits temporarily unavailable${reset}" ;;
-        *)         printf "\n\n${dim}⚠ api error (${api_error})${reset}" ;;
+        no_token)
+            printf "\n\n${dim}⚠ no token — rate limits unavailable${reset}" ;;
+        rate_limited)
+            _wait=$(_retry_wait_msg "$retry_until")
+            printf "\n\n${yellow}⚠ 429 rate limited${_wait}${reset}" ;;
+        auth_expired)
+            printf "\n\n${red}⚠ 401 token expired — re-login may be needed${reset}" ;;
+        forbidden)
+            printf "\n\n${red}⚠ 403 access denied${reset}" ;;
+        server_error:*)
+            _code="${api_error#server_error:}"
+            _wait=$(_retry_wait_msg "$retry_until")
+            printf "\n\n${yellow}⚠ ${_code} server error${_wait}${reset}" ;;
+        network_error)
+            _wait=$(_retry_wait_msg "$retry_until")
+            printf "\n\n${dim}⚠ network error${_wait}${reset}" ;;
+        http_error:*)
+            _code="${api_error#http_error:}"
+            printf "\n\n${dim}⚠ HTTP ${_code}${reset}" ;;
+        cached:*)
+            # cached:<http_code>:<message>
+            IFS=':' read -r _ _code _msg <<< "$api_error"
+            case "$_code" in
+                429) printf "\n\n${yellow}⚠ rate limited$(_retry_wait_msg "$retry_until_epoch")${reset}" ;;
+                401) printf "\n\n${red}⚠ token expired — re-login may be needed${reset}" ;;
+                403) printf "\n\n${red}⚠ access denied${reset}" ;;
+                5[0-9][0-9]) printf "\n\n${yellow}⚠ server error$(_retry_wait_msg "$retry_until_epoch")${reset}" ;;
+                000) printf "\n\n${dim}⚠ network error$(_retry_wait_msg "$retry_until_epoch")${reset}" ;;
+                *)   printf "\n\n${dim}⚠ HTTP ${_code}$(_retry_wait_msg "$retry_until_epoch")${reset}" ;;
+            esac
+            ;;
+        *)
+            printf "\n\n${dim}⚠ ${api_error}${reset}" ;;
     esac
 fi
 
