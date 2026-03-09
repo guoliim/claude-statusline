@@ -116,14 +116,17 @@ format_reset_time() {
 }
 
 # ── Extract JSON data ───────────────────────────────────
-model_name=$(echo "$input" | jq -r '.model.display_name // "Claude"')
-
-size=$(echo "$input" | jq -r '.context_window.context_window_size // 200000')
+IFS=$'\t' read -r model_name size input_tokens cache_create cache_read cwd session_start <<< \
+  "$(echo "$input" | jq -r '[
+    (.model.display_name // "Claude"),
+    (.context_window.context_window_size // 200000 | tostring),
+    (.context_window.current_usage.input_tokens // 0 | tostring),
+    (.context_window.current_usage.cache_creation_input_tokens // 0 | tostring),
+    (.context_window.current_usage.cache_read_input_tokens // 0 | tostring),
+    (.cwd // ""),
+    (.session.start_time // "")
+  ] | join("\t")')"
 [ "$size" -eq 0 ] 2>/dev/null && size=200000
-
-input_tokens=$(echo "$input" | jq -r '.context_window.current_usage.input_tokens // 0')
-cache_create=$(echo "$input" | jq -r '.context_window.current_usage.cache_creation_input_tokens // 0')
-cache_read=$(echo "$input" | jq -r '.context_window.current_usage.cache_read_input_tokens // 0')
 current=$(( input_tokens + cache_create + cache_read ))
 
 used_tokens=$(format_tokens $current)
@@ -144,7 +147,6 @@ fi
 
 # ── LINE 1: Model │ Context % │ Directory (branch) │ Session │ Thinking ──
 pct_color=$(color_for_pct "$pct_used")
-cwd=$(echo "$input" | jq -r '.cwd // ""')
 [ -z "$cwd" ] || [ "$cwd" = "null" ] && cwd=$(pwd)
 dirname=$(basename "$cwd")
 
@@ -158,7 +160,6 @@ if git -C "$cwd" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
 fi
 
 session_duration=""
-session_start=$(echo "$input" | jq -r '.session.start_time // empty')
 if [ -n "$session_start" ] && [ "$session_start" != "null" ]; then
     start_epoch=$(iso_to_epoch "$session_start")
     if [ -n "$start_epoch" ]; then
