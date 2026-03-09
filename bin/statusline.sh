@@ -242,14 +242,17 @@ get_oauth_token() {
 # ── Fetch usage data (cached) ──────────────────────────
 cache_file="/tmp/claude/statusline-usage-cache.json"
 cache_max_age=60
+err_cache="/tmp/claude/statusline-usage-error"
+err_max_age=300
 mkdir -p /tmp/claude
 
 needs_refresh=true
 usage_data=""
+api_error=""
+now=$(date +%s)
 
 if [ -f "$cache_file" ]; then
     cache_mtime=$(stat -c %Y "$cache_file" 2>/dev/null || stat -f %m "$cache_file" 2>/dev/null)
-    now=$(date +%s)
     cache_age=$(( now - cache_mtime ))
     if [ "$cache_age" -lt "$cache_max_age" ]; then
         needs_refresh=false
@@ -257,21 +260,44 @@ if [ -f "$cache_file" ]; then
     fi
 fi
 
+# Skip refresh if in negative cache period (recent API failure)
+if $needs_refresh && [ -f "$err_cache" ]; then
+    err_mtime=$(stat -c %Y "$err_cache" 2>/dev/null || stat -f %m "$err_cache" 2>/dev/null)
+    if [ -n "$err_mtime" ]; then
+        err_age=$(( now - err_mtime ))
+        if [ "$err_age" -lt "$err_max_age" ]; then
+            needs_refresh=false
+            api_error="cached"
+        fi
+    fi
+fi
+
 if $needs_refresh; then
     token=$(get_oauth_token)
     if [ -n "$token" ] && [ "$token" != "null" ]; then
+        claude_ver=$(timeout 0.5 claude --version 2>/dev/null | head -1 || echo "unknown")
         response=$(curl -s --max-time 5 \
             -H "Accept: application/json" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $token" \
             -H "anthropic-beta: oauth-2025-04-20" \
-            -H "User-Agent: claude-code/2.1.34" \
+            -H "User-Agent: claude-statusline/1.0 (claude-code/${claude_ver})" \
             "https://api.anthropic.com/api/oauth/usage" 2>/dev/null)
         if [ -n "$response" ] && echo "$response" | jq -e '.five_hour' >/dev/null 2>&1; then
             usage_data="$response"
-            echo "$response" > "$cache_file"
+            echo "$response" > "${cache_file}.tmp" && mv "${cache_file}.tmp" "$cache_file"
+            rm -f "$err_cache"
+        elif [ -n "$response" ] && echo "$response" | jq -e '.error' >/dev/null 2>&1; then
+            api_error=$(echo "$response" | jq -r '.error.type // "unknown"')
+            touch "$err_cache"
+        else
+            api_error="request_failed"
+            touch "$err_cache"
         fi
+    else
+        api_error="no_token"
     fi
+    # Fall back to stale cache if available
     if [ -z "$usage_data" ] && [ -f "$cache_file" ]; then
         usage_data=$(cat "$cache_file" 2>/dev/null)
     fi
