@@ -283,8 +283,19 @@ rate_lines=""
 if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
     bar_width=10
 
-    five_hour_pct=$(echo "$usage_data" | jq -r '.five_hour.utilization // 0' | awk '{printf "%.0f", $1}')
-    five_hour_reset_iso=$(echo "$usage_data" | jq -r '.five_hour.resets_at // empty')
+    IFS=$'\t' read -r five_hour_pct five_hour_reset_iso seven_day_pct seven_day_reset_iso \
+        extra_enabled extra_pct extra_used extra_limit <<< \
+      "$(echo "$usage_data" | jq -r '[
+        (.five_hour.utilization // 0 | round | tostring),
+        (.five_hour.resets_at // ""),
+        (.seven_day.utilization // 0 | round | tostring),
+        (.seven_day.resets_at // ""),
+        (.extra_usage.is_enabled // false | tostring),
+        (.extra_usage.utilization // 0 | round | tostring),
+        (.extra_usage.used_credits // 0 | . / 100 | tostring),
+        (.extra_usage.monthly_limit // 0 | . / 100 | tostring)
+      ] | join("\t")')"
+
     five_hour_reset=$(format_reset_time "$five_hour_reset_iso" "time")
     five_hour_bar=$(build_bar "$five_hour_pct" "$bar_width")
     five_hour_pct_color=$(color_for_pct "$five_hour_pct")
@@ -292,8 +303,6 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
 
     rate_lines+="${white}current${reset} ${five_hour_bar} ${five_hour_pct_color}${five_hour_pct_fmt}%${reset} ${dim}⟳${reset} ${white}${five_hour_reset}${reset}"
 
-    seven_day_pct=$(echo "$usage_data" | jq -r '.seven_day.utilization // 0' | awk '{printf "%.0f", $1}')
-    seven_day_reset_iso=$(echo "$usage_data" | jq -r '.seven_day.resets_at // empty')
     seven_day_reset=$(format_reset_time "$seven_day_reset_iso" "datetime")
     seven_day_bar=$(build_bar "$seven_day_pct" "$bar_width")
     seven_day_pct_color=$(color_for_pct "$seven_day_pct")
@@ -301,11 +310,9 @@ if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
 
     rate_lines+="\n${white}weekly${reset}  ${seven_day_bar} ${seven_day_pct_color}${seven_day_pct_fmt}%${reset} ${dim}⟳${reset} ${white}${seven_day_reset}${reset}"
 
-    extra_enabled=$(echo "$usage_data" | jq -r '.extra_usage.is_enabled // false')
     if [ "$extra_enabled" = "true" ]; then
-        extra_pct=$(echo "$usage_data" | jq -r '.extra_usage.utilization // 0' | awk '{printf "%.0f", $1}')
-        extra_used=$(echo "$usage_data" | jq -r '.extra_usage.used_credits // 0' | awk '{printf "%.2f", $1/100}')
-        extra_limit=$(echo "$usage_data" | jq -r '.extra_usage.monthly_limit // 0' | awk '{printf "%.2f", $1/100}')
+        extra_used=$(printf "%.2f" "$extra_used")
+        extra_limit=$(printf "%.2f" "$extra_limit")
         extra_bar=$(build_bar "$extra_pct" "$bar_width")
         extra_pct_color=$(color_for_pct "$extra_pct")
 
